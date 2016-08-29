@@ -1,0 +1,129 @@
+#!/bin/bash
+#----------------------------------------------------------------
+# [Antonio Insuasti - 2016] Sistema de Replica a GYE
+# 	El script realiza una copia de todo el /home/jboss
+#	a partir del instances.conf reconoce las versiones de cada
+#	instancia. realiza los cambios necesarios para adaptar	
+#	la instancia al ambiente de contingencia.
+#	Recive como paramentro el servidor al cual se va a 
+#	replicar.
+#	USO:
+#  		./replica ${hostname}
+#	Donde:
+#        #hostname: es el nombre/ip del servidor a replicar la
+#		    la carpeta /home/jboss 
+#		    El servidor debe tener el certificado del 
+#		    usuario jboss para conectarse. 	
+#	TO-DO
+#	 Crear un parametro para tomar el home del usuario a 
+#	 replicar, con este cambio serviria para migrar 
+#	 cualquier instancia de otro sistema 
+#	 
+#----------------------------------------------------------------
+#Copyright (c) 28/08/2016 Antonio Insuasti.
+#
+
+#----- Variables ---
+config_file=/home/jboss/instances.conf
+serverprod=$1
+changes_file=/home/jboss/bin/cambios
+filesToChange=/tmp/filesToChange
+date=$(date +%Y%m%d)
+
+#------ funciones
+
+# Funcion de busqueda de archivos con datos antiguos.
+# crea un lista de archivos para realizar los cambios
+# en el archivo /tmp/listaCambios
+# luego de terminar la busqueda, borra los posibles
+# archivos duplicados y procede a cambiar los datos
+# Parametros:
+#         $1: Carpeta donde realizar la busqueda
+
+function searchForChanges {
+ while read line ; do
+    old_data=$(echo $line | cut -d: -f2 )
+    grep -Rl $old_data $1 >>$filesToChange
+ done < $changes_file
+ sort $filesToChange | uniq >/tmp/listaCambios
+ while read line ; do
+    changeFile $line
+ done < /tmp/listaCambios
+     
+      
+}
+
+# Funcion que cambia los datos en un archivo
+# Toma el archivo con la lista de cambios
+# y realiza el cambio en un archivo
+# Parametros:
+#      $1: Archivo al cual se realiza el cambio
+ 
+function changeFile  {
+	 #obtiene un respaldo del archivo antes del cambio
+         cp $1 ${1}.${date}
+     while read line ; do
+         old_data=$(echo $line | cut -d: -f2 )
+         new_data=$(echo $line | cut -d: -f1 )
+         perl -pi -e "s/$old_data/$new_data/g" $1
+     done < $changes_file
+}
+
+
+#----- body
+
+#Validacion del servidor a conectarse
+#TO-DO validar la conexion ssh 
+ 
+if [  "x$serverprod" = "x" ] ;then
+echo "Se debe especificar un servidor de produccion"
+exit 1
+fi
+
+#obtener toda la carpeta /home/jboss con las exclusiones de logs y archivos innecesarios
+
+cd ~
+/usr/bin/rsync -aPv  --exclude "lost+found"  --exclude "nohup.out"    --exclude "rhq-agent" --exclude ".ssh" --exclude "log" --exclude "data" --exclude "tmp" --include="${JBOSS_DIR}/bin" --exclude "all" --exclude "default"  --exclude "production" --exclude "minimal" --exclude "client" jboss@${serverprod}:/home/jboss/. /home/jboss/
+
+# Se separa la obtencion del instances.conf debido a que si en el comando anterior se aumenta el -L se duplica las instancias de jboss
+# en su carpeta original y en su link simbolico.
+
+rsync -aLPv jboss@${serverprod}:/home/jboss/instances.conf /home/jboss/instances.conf
+
+#limpio el archivo de cambios antes del inicio
+cat /dev/null >$filesToChange
+
+#todo se obtiene del instances.conf
+
+
+while read -d '@' line; do
+         change_dir=""
+         start_file=""
+	 stop_file=""
+        if [[ $REPLY =~ ^$ ]]; then
+             #Obtiene los datos de la instancia
+              for data in $line ; do
+                  if [[ $data =~ ^home_dir ]] ; then
+                    change_dir=$( echo $data | cut -d= -f2 )
+                  fi
+		  if [[ $data =~ ^stop ]] ; then
+                    stop_file=$( echo $data | cut -d= -f2 )
+                  fi
+		  if [[ $data =~ ^start ]] ; then
+                    start_file=$( echo $data | cut -d= -f2 )
+                  fi
+              done
+              
+	     # Limpio el archivo de cambios en cada iteracion 
+		cat /dev/null >$filesToChange
+	     # Se envia a buscar archivos en la direccion de la instancia
+	     changePath="/home/jboss/$(echo $change_dir | awk 'BEGIN {FS="/";}{print $4}')"
+             searchForChanges "${changePath}/*"
+	     # cambia los scripts de start y stop
+	     cd /home/jboss/
+             changeFile $stop_file
+	     changeFile $start_file 
+	     
+        fi
+    done  < <( awk -v RS='\n\n' '{ printf "%s@" , $0 }' $config_file )
+
